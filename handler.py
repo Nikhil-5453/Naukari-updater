@@ -131,28 +131,108 @@ def screenshot(page, label: str) -> None:
 # Naukri actions
 # ─────────────────────────────────────────────────────────────────────────────
 
+def find_element_any(page, selectors: list, timeout: int = 10_000):
+    """Try multiple selectors in order, return first visible one."""
+    for sel in selectors:
+        try:
+            el = page.locator(sel).first
+            el.wait_for(state="visible", timeout=timeout)
+            log.info(f"Found element with selector: {sel}")
+            return el
+        except Exception:
+            log.info(f"Selector not found: {sel}")
+    return None
+
+
 def login(page) -> None:
     log.info("Logging in to Naukri...")
     page.goto(NAUKRI_LOGIN_URL, wait_until="domcontentloaded", timeout=TIMEOUT)
-    time.sleep(2)
+
+    # Wait for page to fully settle
+    time.sleep(5)
+    screenshot(page, "login_page_loaded")
+    log.info(f"Page title: {page.title()}")
+    log.info(f"Page URL: {page.url}")
+
     dismiss_popup(page)
 
-    email_input = page.locator("input[type='text'][placeholder*='Email'], input[type='email']").first
-    email_input.wait_for(timeout=TIMEOUT)
-    email_input.fill(NAUKRI_EMAIL)
+    # Email field - try every known Naukri selector
+    email_selectors = [
+        "input#usernameField",
+        "input[name='username']",
+        "input[placeholder='Enter your active Email ID / Username']",
+        "input[placeholder*='Email']",
+        "input[placeholder*='email']",
+        "input[placeholder*='Username']",
+        "input[type='email']",
+        "input[type='text']",
+        "form input:first-of-type",
+    ]
+    email_input = find_element_any(page, email_selectors, timeout=15_000)
+    if email_input is None:
+        screenshot(page, "email_field_not_found")
+        raise RuntimeError("Could not find email input field. Check screenshot in S3 debug/.")
 
-    page.locator("input[type='password']").first.fill(NAUKRI_PASSWORD)
+    email_input.click()
+    email_input.fill("")
+    email_input.type(NAUKRI_EMAIL, delay=50)
+    time.sleep(1)
 
-    page.locator("button[type='submit']:has-text('Login')").first.click()
-    page.wait_for_load_state("networkidle", timeout=TIMEOUT)
-    time.sleep(3)
+    # Password field
+    pwd_selectors = [
+        "input#passwordField",
+        "input[name='password']",
+        "input[placeholder='Enter your password']",
+        "input[placeholder*='password']",
+        "input[placeholder*='Password']",
+        "input[type='password']",
+    ]
+    pwd_input = find_element_any(page, pwd_selectors, timeout=10_000)
+    if pwd_input is None:
+        screenshot(page, "password_field_not_found")
+        raise RuntimeError("Could not find password input field. Check screenshot in S3 debug/.")
+
+    pwd_input.click()
+    pwd_input.fill("")
+    pwd_input.type(NAUKRI_PASSWORD, delay=50)
+    time.sleep(1)
+
+    screenshot(page, "before_submit")
+
+    # Submit button
+    submit_selectors = [
+        "button[type='submit']",
+        "button:has-text('Login')",
+        "button:has-text('Sign In')",
+        "input[type='submit']",
+        "button.loginButton",
+        "[data-ga-track*='login']",
+    ]
+    submit_btn = find_element_any(page, submit_selectors, timeout=10_000)
+    if submit_btn is None:
+        screenshot(page, "submit_btn_not_found")
+        raise RuntimeError("Could not find login submit button. Check screenshot in S3 debug/.")
+
+    submit_btn.click()
+
+    try:
+        page.wait_for_load_state("networkidle", timeout=30_000)
+    except Exception:
+        pass
+    time.sleep(5)
 
     current = page.url
     log.info(f"Post-login URL: {current}")
-    if "login" in current.lower():
-        screenshot(page, "login_failed")
-        raise RuntimeError("Login failed — still on login page. Check credentials or OTP requirement.")
+    screenshot(page, "post_login")
+
+    if "nlogin" in current.lower() or "login" in current.lower():
+        raise RuntimeError(
+            "Login failed - still on login page. "
+            "Check credentials in SSM or OTP may be required. "
+            "See screenshot in S3 debug/."
+        )
     log.info("Login successful.")
+
 
 
 def update_resume(page, resume_path: str) -> None:
