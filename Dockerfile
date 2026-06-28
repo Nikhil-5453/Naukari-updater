@@ -1,39 +1,48 @@
-# Dockerfile
-# Builds a Lambda-compatible container image with Playwright + Chromium.
-# Lambda does not support GUI; we install Chromium headlessly via Playwright.
-
 FROM public.ecr.aws/lambda/python:3.12
 
-# ── System dependencies for Chromium ─────────────────────────────────────────
+# Chromium dependencies via dnf (Amazon Linux 2023)
 RUN dnf install -y \
+    alsa-lib \
     atk \
     at-spi2-atk \
+    at-spi2-core \
+    cairo \
     cups-libs \
+    dbus-libs \
+    expat \
+    gdk-pixbuf2 \
+    glib2 \
+    gtk3 \
     libdrm \
-    libXcomposite \
-    libXdamage \
-    libXfixes \
-    libXrandr \
     libgbm \
+    libX11 \
+    libX11-xcb \
+    libXcomposite \
+    libXcursor \
+    libXdamage \
+    libXext \
+    libXfixes \
+    libXi \
+    libXrandr \
+    libXrender \
+    libXScrnSaver \
+    libXtst \
+    libxcb \
     libxkbcommon \
     mesa-libgbm \
+    nspr \
     nss \
+    nss-util \
     pango \
     xdg-utils \
     && dnf clean all
 
-# ── Python dependencies ───────────────────────────────────────────────────────
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ── Install Playwright's Chromium into /tmp-compatible path ──────────────────
-# PLAYWRIGHT_BROWSERS_PATH must be writable at runtime; /ms-playwright is baked
-# into the image layer (read-only at runtime is fine — Playwright reads it).
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
-RUN playwright install chromium --with-deps
+RUN playwright install chromium
 
-# ── Copy Lambda handler ───────────────────────────────────────────────────────
 COPY handler.py ${LAMBDA_TASK_ROOT}/handler.py
 
-# ── Lambda entry point ────────────────────────────────────────────────────────
 CMD ["handler.lambda_handler"]
