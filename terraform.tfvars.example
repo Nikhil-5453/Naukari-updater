@@ -1,0 +1,15 @@
+# terraform/terraform.tfvars
+# Copy this file and fill in your values.
+# Do NOT commit to git — add terraform.tfvars to .gitignore
+
+aws_region      = "ap-south-1"
+s3_bucket       = "my-naukri-assets"       # your S3 bucket name
+s3_resume_key   = "resume.pdf"
+s3_headline_key = "headline.txt"
+
+naukri_email    = "your_email@example.com"
+naukri_password = "your_password_here"
+
+schedule_expression = "rate(1 hour)"
+# Alternatively use cron — e.g. every day at 9 AM IST (3:30 AM UTC):
+# schedule_expression = "cron(30 3 * * ? *)"
