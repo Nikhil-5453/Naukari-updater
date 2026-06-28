@@ -33,7 +33,7 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 RUN playwright install chromium --with-deps
 
 # ── Copy Lambda handler ───────────────────────────────────────────────────────
-COPY src/handler.py ${LAMBDA_TASK_ROOT}/handler.py
+COPY handler.py ${LAMBDA_TASK_ROOT}/handler.py
 
 # ── Lambda entry point ────────────────────────────────────────────────────────
 CMD ["handler.lambda_handler"]

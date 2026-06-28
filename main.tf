@@ -49,7 +49,7 @@ locals {
   # deploy.sh then pushes the real image and calls `aws lambda update-function-code`.
   # lifecycle.ignore_changes = [image_uri] prevents Terraform from ever
   # reverting back to this placeholder on subsequent applies.
-  bootstrap_image = "public.ecr.aws/lambda/python:3.12"
+  # bootstrap_image = "public.ecr.aws/lambda/python:3.12"
 }
 
 # ── ECR Repository ────────────────────────────────────────────────────────────
@@ -142,7 +142,7 @@ resource "aws_lambda_function" "this" {
 
   # Uses public placeholder on first apply so Terraform doesn't fail with
   # "source image does not exist". deploy.sh replaces this with the real image.
-  image_uri = local.bootstrap_image
+  image_uri = "012874738371.dkr.ecr.ap-south-1.amazonaws.com/naukri-updater:latest"
 
   timeout     = 300   # 5 minutes — enough for browser automation
   memory_size = 1024  # Chromium needs headroom

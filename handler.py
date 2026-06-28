@@ -3,11 +3,12 @@ Naukri Profile Auto-Updater — AWS Lambda Handler
 Triggered hourly by EventBridge Scheduler.
 
 Flow:
-  1. Fetch resume PDF + headline.txt from S3
-  2. Launch headless Chromium (via playwright)
-  3. Login to Naukri
-  4. Delete old resume → upload new PDF
-  5. Update profile headline
+  1. Fetch credentials from SSM Parameter Store
+  2. Fetch resume PDF + headline.txt from S3
+  3. Launch headless Chromium (via playwright)
+  4. Login to Naukri
+  5. Delete old resume → upload new PDF
+  6. Update profile headline
 """
 
 import os
@@ -21,17 +22,31 @@ log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)
 
 # ── Config from Lambda Environment Variables ───────────────────────────────────
-NAUKRI_EMAIL      = os.environ["NAUKRI_EMAIL"]
-NAUKRI_PASSWORD   = os.environ["NAUKRI_PASSWORD"]
 S3_BUCKET         = os.environ["S3_BUCKET"]
 S3_RESUME_KEY     = os.environ.get("S3_RESUME_KEY",   "resume.pdf")
 S3_HEADLINE_KEY   = os.environ.get("S3_HEADLINE_KEY", "headline.txt")
-AWS_REGION        = os.environ.get("AWS_REGION",      "ap-south-1")
+AWS_REGION        = os.environ.get("AWS_REGION_NAME", "ap-south-1")
 
-# "https://www.naukri.com/nlogin/login"
-NAUKRI_LOGIN_URL   = "https://www.naukri.com/nlogin/login?srcTemplate=registerfree468x60&utm_source=google&utm_medium=cpc&utm_campaign=Brand_Login_Register&gclsrc=aw.ds&gad_source=1&gad_campaignid=21008292163&gbraid=0AAAAADLp3cFoz7FrCrkooBnDvi0esg4rU&gclid=CjwKCAjw6f3RBhApEiwAMaCqWdIS_tNr_egYngWlbvgw5k1swiUASpPMp4TOa0BYQ8EVQwCObB3DnhoCGSUQAvD_BwE"
-# "https://www.naukri.com/mnjuser/profile"
-NAUKRI_PROFILE_URL = "https://www.naukri.com/mnjuser/profile?id=&altresid"
+# SSM parameter names injected by Terraform as env vars
+SSM_EMAIL_PARAM    = os.environ["SSM_EMAIL_PARAM"]
+SSM_PASSWORD_PARAM = os.environ["SSM_PASSWORD_PARAM"]
+
+
+def get_ssm_secret(param_name: str) -> str:
+    """Fetch a SecureString from SSM Parameter Store."""
+    ssm = boto3.client("ssm", region_name=AWS_REGION)
+    response = ssm.get_parameter(Name=param_name, WithDecryption=True)
+    return response["Parameter"]["Value"]
+
+
+# Fetch credentials from SSM at cold start (cached for warm invocations)
+log.info("Fetching credentials from SSM...")
+NAUKRI_EMAIL    = get_ssm_secret(SSM_EMAIL_PARAM)
+NAUKRI_PASSWORD = get_ssm_secret(SSM_PASSWORD_PARAM)
+log.info("Credentials loaded.")
+
+NAUKRI_LOGIN_URL   = "https://www.naukri.com/nlogin/login"
+NAUKRI_PROFILE_URL = "https://www.naukri.com/mnjuser/profile"
 
 TIMEOUT = 20_000   # ms — Playwright timeout
 
@@ -42,13 +57,13 @@ TIMEOUT = 20_000   # ms — Playwright timeout
 
 def s3_download(key: str, local_path: str) -> None:
     s3 = boto3.client("s3", region_name=AWS_REGION)
-    log.info(f"S3 download: s3://{S3_BUCKET}/{key} → {local_path}")
+    log.info(f"S3 download: s3://{S3_BUCKET}/{key} -> {local_path}")
     s3.download_file(S3_BUCKET, key, local_path)
 
 
-def fetch_assets(tmpdir: str) -> tuple[str, str]:
+def fetch_assets(tmpdir: str) -> tuple:
     """Returns (resume_path, headline_text)."""
-    resume_path = os.path.join(tmpdir, "resume.pdf")
+    resume_path   = os.path.join(tmpdir, "resume.pdf")
     headline_path = os.path.join(tmpdir, "headline.txt")
 
     s3_download(S3_RESUME_KEY,   resume_path)
@@ -74,7 +89,7 @@ def build_browser(playwright):
             "--disable-setuid-sandbox",
             "--disable-dev-shm-usage",
             "--disable-gpu",
-            "--single-process",           # required in Lambda
+            "--single-process",
             "--no-zygote",
             "--disable-blink-features=AutomationControlled",
         ],
@@ -96,17 +111,16 @@ def dismiss_popup(page) -> None:
 
 
 def screenshot(page, label: str) -> None:
-    """Save a debug screenshot to /tmp."""
+    """Save a debug screenshot to /tmp and upload to S3."""
     path = f"/tmp/naukri_{label}_{int(time.time())}.png"
     try:
         page.screenshot(path=path)
-        log.info(f"Screenshot: {path}")
-        # Optionally upload to S3 for remote inspection
+        log.info(f"Screenshot saved: {path}")
         try:
             boto3.client("s3", region_name=AWS_REGION).upload_file(
                 path, S3_BUCKET, f"debug/{os.path.basename(path)}"
             )
-            log.info(f"Screenshot uploaded to s3://{S3_BUCKET}/debug/{os.path.basename(path)}")
+            log.info(f"Screenshot uploaded to s3://{S3_BUCKET}/debug/")
         except Exception as e:
             log.warning(f"Could not upload screenshot: {e}")
     except Exception as e:
@@ -118,20 +132,17 @@ def screenshot(page, label: str) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def login(page) -> None:
-    log.info("Logging in to Naukri…")
+    log.info("Logging in to Naukri...")
     page.goto(NAUKRI_LOGIN_URL, wait_until="domcontentloaded", timeout=TIMEOUT)
     time.sleep(2)
     dismiss_popup(page)
 
-    # Email
     email_input = page.locator("input[type='text'][placeholder*='Email'], input[type='email']").first
     email_input.wait_for(timeout=TIMEOUT)
     email_input.fill(NAUKRI_EMAIL)
 
-    # Password
     page.locator("input[type='password']").first.fill(NAUKRI_PASSWORD)
 
-    # Submit
     page.locator("button[type='submit']:has-text('Login')").first.click()
     page.wait_for_load_state("networkidle", timeout=TIMEOUT)
     time.sleep(3)
@@ -145,12 +156,12 @@ def login(page) -> None:
 
 
 def update_resume(page, resume_path: str) -> None:
-    log.info("Navigating to profile page for resume update…")
+    log.info("Navigating to profile page for resume update...")
     page.goto(NAUKRI_PROFILE_URL, wait_until="domcontentloaded", timeout=TIMEOUT)
     time.sleep(3)
     dismiss_popup(page)
 
-    # ── Delete existing resume ────────────────────────────────────────────────
+    # Delete existing resume
     delete_sel = (
         "[class*='resumeDeleteIcon'], [class*='deleteResume'], "
         "[class*='delete'][class*='resume'] span, "
@@ -161,7 +172,6 @@ def update_resume(page, resume_path: str) -> None:
         if delete_btn.is_visible(timeout=6_000):
             delete_btn.click()
             time.sleep(1)
-            # Confirmation dialog
             confirm_sel = "button:has-text('Delete'), button:has-text('Yes'), button:has-text('Confirm')"
             try:
                 confirm = page.locator(confirm_sel).first
@@ -172,22 +182,18 @@ def update_resume(page, resume_path: str) -> None:
             except Exception:
                 log.info("No confirm dialog — delete may be immediate.")
         else:
-            log.info("No resume to delete (button not visible).")
+            log.info("No resume to delete.")
     except Exception as e:
         log.info(f"Delete step skipped: {e}")
 
-    # ── Upload new resume ─────────────────────────────────────────────────────
+    # Upload new resume
     upload_sel = "input[type='file'][accept*='.pdf'], input[type='file']#attachCV, input[type='file'][class*='resume']"
     upload_input = page.locator(upload_sel).first
     upload_input.wait_for(state="attached", timeout=TIMEOUT)
     upload_input.set_input_files(resume_path)
     time.sleep(5)
 
-    # Confirm success
-    success_sel = (
-        "text=/successfully/i, text=/uploaded/i, "
-        "[class*='success'], [class*='uploadSuccess']"
-    )
+    success_sel = "text=/successfully/i, text=/uploaded/i, [class*='success'], [class*='uploadSuccess']"
     try:
         page.locator(success_sel).first.wait_for(timeout=10_000)
         log.info("Resume uploaded successfully.")
@@ -197,12 +203,11 @@ def update_resume(page, resume_path: str) -> None:
 
 
 def update_headline(page, headline: str) -> None:
-    log.info("Updating profile headline…")
+    log.info("Updating profile headline...")
     page.goto(NAUKRI_PROFILE_URL, wait_until="domcontentloaded", timeout=TIMEOUT)
     time.sleep(3)
     dismiss_popup(page)
 
-    # Click edit pencil next to Resume Headline section
     edit_sel = (
         "#lazyResumeHead [class*='edit'], #lazyResumeHead [class*='pencil'], "
         "[class*='resumeHeadline'] [class*='edit'], "
@@ -217,7 +222,6 @@ def update_headline(page, headline: str) -> None:
         screenshot(page, "headline_edit_btn")
         raise RuntimeError(f"Could not find headline edit button: {e}")
 
-    # Fill textarea
     textarea_sel = "textarea#resumeHeadlineTxt, textarea[placeholder*='headline']"
     try:
         textarea = page.locator(textarea_sel).first
@@ -225,8 +229,9 @@ def update_headline(page, headline: str) -> None:
         textarea.fill(headline)
         time.sleep(1)
 
-        # Save
-        save_btn = page.locator("button[type='submit']:has-text('Save'), button[class*='saveButton']:has-text('Save')").first
+        save_btn = page.locator(
+            "button[type='submit']:has-text('Save'), button[class*='saveButton']:has-text('Save')"
+        ).first
         save_btn.click()
         time.sleep(3)
         log.info("Headline updated successfully.")
@@ -246,20 +251,18 @@ def lambda_handler(event, context):
     from playwright.sync_api import sync_playwright
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        # 1. Fetch assets from S3
         resume_path, headline = fetch_assets(tmpdir)
 
-        # 2. Run browser automation
         with sync_playwright() as pw:
             browser = build_browser(pw)
-            context_bw = browser.new_context(
+            ctx = browser.new_context(
                 user_agent=(
                     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
                 ),
                 viewport={"width": 1920, "height": 1080},
             )
-            page = context_bw.new_page()
+            page = ctx.new_page()
 
             try:
                 login(page)
