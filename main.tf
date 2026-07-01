@@ -1,10 +1,4 @@
 # terraform/main.tf
-# Provisions:
-#   - ECR repository (holds the Docker image)
-#   - IAM role + policies for Lambda
-#   - Lambda function (container image, 1024 MB, 5 min timeout)
-#   - EventBridge Scheduler rule (every 1 hour)
-#   - SSM Parameters for secrets (email / password)
 
 terraform {
   required_version = ">= 1.5"
@@ -26,13 +20,13 @@ variable "aws_region"      { default = "ap-south-1" }
 variable "s3_bucket"       { description = "S3 bucket holding resume.pdf and headline.txt" }
 variable "s3_resume_key"   { default = "resume.pdf" }
 variable "s3_headline_key" { default = "headline.txt" }
-variable "naukri_email"    { 
+variable "naukri_email" {
   description = "Naukri login email"
-  sensitive = true 
-  }
-variable "naukri_password" { 
-  description = "Naukri login password" 
-  sensitive = true 
+  sensitive   = true
+}
+variable "naukri_password" {
+  description = "Naukri login password"
+  sensitive   = true
 }
 variable "schedule_expression" {
   default     = "rate(1 hour)"
@@ -41,15 +35,6 @@ variable "schedule_expression" {
 
 locals {
   name = "naukri-updater"
-
-  # Bootstrap fix: Lambda container image must exist in ECR before the function
-  # can be created — but ECR is empty on first `terraform apply`.
-  #
-  # Solution: create Lambda with this public AWS placeholder image first.
-  # deploy.sh then pushes the real image and calls `aws lambda update-function-code`.
-  # lifecycle.ignore_changes = [image_uri] prevents Terraform from ever
-  # reverting back to this placeholder on subsequent applies.
-  # bootstrap_image = "public.ecr.aws/lambda/python:3.12"
 }
 
 # ── ECR Repository ────────────────────────────────────────────────────────────
@@ -77,6 +62,17 @@ resource "aws_ssm_parameter" "password" {
   value = var.naukri_password
 }
 
+# Session cookie cache — written at runtime by Lambda, seeded empty here
+resource "aws_ssm_parameter" "session_cookie" {
+  name  = "/${local.name}/SESSION_COOKIE"
+  type  = "SecureString"
+  value = "{}"
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
 # ── IAM Role for Lambda ───────────────────────────────────────────────────────
 
 data "aws_iam_policy_document" "assume" {
@@ -100,23 +96,21 @@ resource "aws_iam_role_policy_attachment" "basic" {
 }
 
 data "aws_iam_policy_document" "permissions" {
-  # S3 — read resume + headline, write debug screenshots
   statement {
-    actions   = ["s3:GetObject", "s3:ListBucket", "s3:PutObject"]
+    actions = ["s3:GetObject", "s3:ListBucket", "s3:PutObject"]
     resources = [
       "arn:aws:s3:::${var.s3_bucket}",
       "arn:aws:s3:::${var.s3_bucket}/*",
     ]
   }
-  # SSM — read credentials at cold start
   statement {
-    actions   = ["ssm:GetParameter", "ssm:GetParameters"]
+    actions = ["ssm:GetParameter", "ssm:GetParameters", "ssm:PutParameter"]
     resources = [
       aws_ssm_parameter.email.arn,
       aws_ssm_parameter.password.arn,
+      aws_ssm_parameter.session_cookie.arn,
     ]
   }
-  # ECR — pull image (needed for Lambda container)
   statement {
     actions = [
       "ecr:GetDownloadUrlForLayer",
@@ -134,18 +128,25 @@ resource "aws_iam_role_policy" "permissions" {
 }
 
 # ── Lambda Function ───────────────────────────────────────────────────────────
+# IMPORTANT: Run these in order:
+#   1. terraform apply -target=aws_ecr_repository.this
+#   2. docker build + docker push  (see deploy.sh)
+#   3. terraform apply             (full apply — image now exists in ECR)
+#
+# After first full apply, all future image updates go through deploy.sh only.
+# lifecycle.ignore_changes = [image_uri] prevents Terraform from interfering.
 
 resource "aws_lambda_function" "this" {
   function_name = local.name
   role          = aws_iam_role.lambda.arn
   package_type  = "Image"
 
-  # Uses public placeholder on first apply so Terraform doesn't fail with
-  # "source image does not exist". deploy.sh replaces this with the real image.
-  image_uri = "012874738371.dkr.ecr.ap-south-1.amazonaws.com/naukri-updater:latest"
+  # Points to your real ECR image — must exist before this resource is applied.
+  # Use the targeted apply workflow above to guarantee ordering.
+  image_uri = "${aws_ecr_repository.this.repository_url}:latest"
 
-  timeout     = 300   # 5 minutes — enough for browser automation
-  memory_size = 1024  # Chromium needs headroom
+  timeout     = 300
+  memory_size = 1024
 
   environment {
     variables = {
@@ -155,12 +156,13 @@ resource "aws_lambda_function" "this" {
       AWS_REGION_NAME    = var.aws_region
       SSM_EMAIL_PARAM    = aws_ssm_parameter.email.name
       SSM_PASSWORD_PARAM = aws_ssm_parameter.password.name
+      SSM_COOKIE_PARAM   = aws_ssm_parameter.session_cookie.name
+      PROXY_URL          = ""
     }
   }
 
-  # Terraform must NOT revert image_uri back to the placeholder after
-  # deploy.sh has pushed the real image. All image updates go through
-  # `aws lambda update-function-code` in deploy.sh — not through Terraform.
+  # After the first apply, deploy.sh owns all image updates.
+  # Terraform must not revert the image_uri back.
   lifecycle {
     ignore_changes = [image_uri]
   }
@@ -168,7 +170,7 @@ resource "aws_lambda_function" "this" {
   depends_on = [aws_iam_role_policy_attachment.basic]
 }
 
-# ── EventBridge Scheduler (hourly trigger) ────────────────────────────────────
+# ── EventBridge Scheduler ─────────────────────────────────────────────────────
 
 resource "aws_iam_role" "scheduler" {
   name = "${local.name}-scheduler-role"
@@ -200,7 +202,7 @@ resource "aws_scheduler_schedule" "hourly" {
 
   flexible_time_window { mode = "OFF" }
 
-  schedule_expression = var.schedule_expression   # "rate(1 hour)"
+  schedule_expression = var.schedule_expression
 
   target {
     arn      = aws_lambda_function.this.arn
